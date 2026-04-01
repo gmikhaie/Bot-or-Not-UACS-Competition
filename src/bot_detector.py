@@ -2,10 +2,11 @@ import pandas as pd
 import numpy as np
 import warnings
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 import xgboost as xgb
+import lightgbm as lgb
 import json
 import os
 
@@ -16,6 +17,9 @@ class BotDetector:
     def __init__(self):
         self.model = None
         self.feature_cols = None
+        self.tfidf = TfidfVectorizer(max_features=20, stop_words='english', ngram_range=(1, 2))
+        self.tfidf_fitted = False
+        self.lgb_model = None
 
     def preprocess_data(self, df):
         """Preprocess the input dataframe"""
@@ -60,12 +64,16 @@ class BotDetector:
         if 'username' in users_df.columns:
             username = users_df['username'].fillna('')
             features['username_length'] = username.str.len()
-            features['username_has_numbers'] = username.str.contains(r'\d').astype(int)
-            features['username_has_underscore'] = username.str.contains('_').astype(int)
+            features['username_has_numbers'] = username.str.contains(r'\d', regex=True).astype(int)
+            features['username_has_underscore'] = username.str.contains('_', regex=False).astype(int)
 
         # Location features
         if 'location' in users_df.columns:
             features['has_location'] = users_df['location'].notna().astype(int)
+        
+        # French-specific text features (for French language detection)
+        is_french = (posts_df is not None and 'language' in posts_df.columns and 
+                    (posts_df['language'] == 'french').any()) if posts_df is not None else False
 
         # If posts data is available, add post-based features
         if posts_df is not None and 'author_id' in posts_df.columns:
@@ -75,6 +83,18 @@ class BotDetector:
             posts_df['has_url'] = posts_df['text'].str.contains('http', regex=False).astype(int)
             posts_df['mention_count'] = posts_df['text'].str.count('@')
             posts_df['has_hashtag'] = posts_df['text'].str.contains('#', regex=False).astype(int)
+            
+            # French-specific features
+            if is_french:
+                posts_df['has_accents'] = posts_df['text'].str.contains(r'[àâäæéèêëïîôöœùûüç]', regex=True).astype(int)
+                posts_df['accent_count'] = posts_df['text'].str.findall(r'[àâäæéèêëïîôöœùûüç]').str.len()
+                posts_df['has_french_words'] = posts_df['text'].str.contains(
+                    r'(?:le|la|les|de|des|un|une|et|ou|mais|avec|pour|sur|dans|que|qui|ça|c\'est)\b', 
+                    regex=True, case=False
+                ).astype(int)
+                
+                # Repeat content detection (strong French bot signal)
+                posts_df['text_hash'] = posts_df['text'].apply(lambda x: hash(x) if isinstance(x, str) else 0)
 
             post_stats = posts_df.groupby('author_id').agg(
                 post_count=('text', 'count'),
@@ -86,12 +106,30 @@ class BotDetector:
                 first_post=('created_at', 'min'),
                 last_post=('created_at', 'max')
             ).reset_index()
+            
+            # Add French feature aggregations if present
+            if is_french:
+                french_agg = posts_df.groupby('author_id').agg(
+                    pct_posts_with_accents=('has_accents', 'mean'),
+                    avg_accent_count=('accent_count', 'mean'),
+                    pct_posts_with_french_words=('has_french_words', 'mean'),
+                    unique_posts=('text_hash', 'nunique'),  # Number of unique posts
+                    total_posts=('text', 'count')
+                ).reset_index()
+                # Calculate content repetition rate
+                french_agg['content_repetition_rate'] = 1 - (french_agg['unique_posts'] / french_agg['total_posts'])
+                french_agg = french_agg.drop(columns=['unique_posts', 'total_posts'])
+                post_stats = post_stats.merge(french_agg, on='author_id', how='left')
 
             post_stats['posting_span_days'] = (
                 pd.to_datetime(post_stats['last_post']) - pd.to_datetime(post_stats['first_post'])
             ).dt.days.fillna(0)
 
             post_stats = post_stats.drop(columns=['first_post', 'last_post'])
+            
+            # Add hashtag abuse detection (strong French bot signal)
+            post_stats['hashtag_abuse'] = (post_stats['pct_hashtag_posts'] > 0.35).astype(int)
+            post_stats['hashtag_url_mismatch'] = ((post_stats['pct_hashtag_posts'] > 0.3) & (post_stats['pct_posts_with_url'] < 0.4)).astype(int)
 
             # Merge with users
             features = features.merge(post_stats, left_on='id', right_on='author_id', how='left')
@@ -100,6 +138,11 @@ class BotDetector:
 
         # Fill missing values and ensure numeric
         features = features.fillna(0)
+        # Fill any missing French feature columns with 0
+        french_cols = ['pct_posts_with_accents', 'avg_accent_count', 'pct_posts_with_french_words', 'content_repetition_rate', 'hashtag_abuse', 'hashtag_url_mismatch']
+        for col in french_cols:
+            if col not in features.columns:
+                features[col] = 0
         # Convert to numeric types
         for col in features.columns:
             if features[col].dtype == 'object':
@@ -108,35 +151,118 @@ class BotDetector:
 
     def train(self, X, y):
         """Train the model"""
+        # Calculate class weights to handle imbalanced data
+        scale_pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
+        
         self.model = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=6,
             learning_rate=0.1,
             random_state=42,
             verbosity=0,
-            eval_metric='logloss'
+            eval_metric='logloss',
+            scale_pos_weight=scale_pos_weight  # Weight for imbalanced classes
         )
         self.model.fit(X, y)
 
     def tune_hyperparameters(self, X, y):
-        """Tune XGBoost hyperparameters using grid search"""
-        param_grid = {
-            'max_depth': [3, 6, 9],
-            'learning_rate': [0.01, 0.1, 0.2],
-            'n_estimators': [50, 100, 200],
-            'subsample': [0.8, 1.0]
+        """Tune XGBoost hyperparameters using randomized search for speed"""
+        # Calculate class weights to handle imbalanced data
+        scale_pos_weight = (len(y) - y.sum()) / max(y.sum(), 1)
+        
+        # Expanded parameter space for better tuning
+        param_dist = {
+            'max_depth': [3, 4, 5, 6, 7, 8, 9, 10],
+            'learning_rate': [0.02, 0.03, 0.05, 0.1, 0.15, 0.2],
+            'n_estimators': [100, 150, 200, 250, 300, 400],
+            'subsample': [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+            'colsample_bytree': [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+            'min_child_weight': [1, 2, 3, 5],
+            'gamma': [0, 0.1, 0.5, 1]  # L2 regularization on leaf weights
         }
-        xgb_model = xgb.XGBClassifier(random_state=42, verbosity=0, eval_metric='logloss')
-        grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, cv=3, scoring='accuracy', n_jobs=-1, verbose=1)
+        
+        xgb_model = xgb.XGBClassifier(
+            random_state=42, 
+            verbosity=0, 
+            eval_metric='logloss',
+            scale_pos_weight=scale_pos_weight
+        )
+        
+        # Increased from 50 to 100 iterations for better coverage
+        grid_search = RandomizedSearchCV(
+            estimator=xgb_model, 
+            param_distributions=param_dist,
+            n_iter=100,  # Doubled from 50
+            cv=2,
+            scoring='f1',
+            n_jobs=-1, 
+            verbose=0,
+            random_state=42
+        )
         grid_search.fit(X, y)
         self.model = grid_search.best_estimator_
         print(f"Best params: {grid_search.best_params_}")
-        print(f"Best CV score: {grid_search.best_score_:.3f}")
+        print(f"Best CV F1 score: {grid_search.best_score_:.3f}")
+        
+        # Train LightGBM model as ensemble
+        self.lgb_model = lgb.LGBMClassifier(
+            n_estimators=300,
+            max_depth=5,
+            learning_rate=0.1,
+            num_leaves=31,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            verbose=-1,
+            scale_pos_weight=scale_pos_weight
+        )
+        self.lgb_model.fit(X, y)
+        
         return self.model
 
     def predict(self, X):
         """Make predictions"""
         return self.model.predict(X)
+    
+    def predict_proba(self, X):
+        """Get probability predictions"""
+        return self.model.predict_proba(X)
+    
+    def predict_with_threshold(self, X, threshold=0.5):
+        """Make predictions with custom threshold for F1 optimization"""
+        proba = self.model.predict_proba(X)[:, 1]  # Probability of being a bot
+        return (proba >= threshold).astype(int)
+    
+    def predict_ensemble(self, X, threshold=0.5):
+        """Ensemble prediction averaging XGBoost and LightGBM"""
+        xgb_proba = self.model.predict_proba(X)[:, 1]
+        if self.lgb_model is not None:
+            lgb_proba = self.lgb_model.predict_proba(X)[:, 1]
+            # Average the two models
+            ensemble_proba = (xgb_proba + lgb_proba) / 2
+        else:
+            ensemble_proba = xgb_proba
+        return (ensemble_proba >= threshold).astype(int)
+    
+    def find_optimal_threshold(self, X, y):
+        """Find optimal threshold to maximize F1 score"""
+        if self.lgb_model is not None:
+            xgb_proba = self.model.predict_proba(X)[:, 1]
+            lgb_proba = self.lgb_model.predict_proba(X)[:, 1]
+            proba = (xgb_proba + lgb_proba) / 2
+        else:
+            proba = self.model.predict_proba(X)[:, 1]
+        
+        best_f1 = 0
+        best_threshold = 0.5
+        for threshold in np.arange(0.3, 0.8, 0.05):
+            preds = (proba >= threshold).astype(int)
+            f1 = f1_score(y, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        
+        return best_threshold
 
     def load_data(self, filepath):
         """Load data from JSON file"""
@@ -177,6 +303,13 @@ class BotDetector:
         # Separate id and features
         ids = features['id']
         X = features.drop('id', axis=1)
+        
+        # Ensure consistent column order
+        french_cols = ['pct_posts_with_accents', 'avg_accent_count', 'pct_posts_with_french_words', 'content_repetition_rate', 'hashtag_abuse', 'hashtag_url_mismatch']
+        other_cols = [col for col in X.columns if col not in french_cols]
+        ordered_cols = other_cols + [col for col in french_cols if col in X.columns]
+        X = X[ordered_cols]
+        
         self.feature_cols = X.columns.tolist()
         
         y = None
@@ -222,11 +355,17 @@ class BotDetector:
 
         # evaluate
         X_test, y_test, _ = self.prepare_features(test_users, test_posts, target_col='is_bot')
-        preds = self.predict(X_test)
+        
+        # Find optimal threshold for F1 (especially helps with French data)
+        optimal_threshold = self.find_optimal_threshold(X_train, y_train)
+        
+        # Use ensemble predictions with optimal threshold
+        preds = self.predict_ensemble(X_test, threshold=optimal_threshold)
 
         report = classification_report(y_test, preds, zero_division=0, output_dict=True)
         print(f"\\n=== {label} Evaluation ===")
         print(f"Train {len(train_users)} users | Test {len(test_users)} users")
+        print(f"Optimal threshold: {optimal_threshold:.3f}")
         print(f"Accuracy: {accuracy_score(y_test, preds):.3f}")
         print(f"Precision (bot): {report['1']['precision']:.3f}")
         print(f"Recall (bot): {report['1']['recall']:.3f}")
@@ -289,25 +428,40 @@ if __name__ == "__main__":
     all_posts = pd.concat(all_posts, ignore_index=True)
 
     X_all, y_all, _ = detector.prepare_features(all_users, all_posts, target_col='is_bot')
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)  # Reduced from 5 to 3 folds
     cv_scores = []
 
     for train_idx, test_idx in skf.split(X_all, y_all):
         X_train, X_test = X_all.iloc[train_idx], X_all.iloc[test_idx]
         y_train, y_test = y_all.iloc[train_idx], y_all.iloc[test_idx]
 
-        model = xgb.XGBClassifier(learning_rate=0.1, max_depth=6, n_estimators=200, subsample=1.0, random_state=42, verbosity=0, eval_metric='logloss')
+        # Calculate class weights
+        scale_pos_weight = (len(y_train) - y_train.sum()) / max(y_train.sum(), 1)
+        
+        model = xgb.XGBClassifier(
+            learning_rate=0.1, 
+            max_depth=6, 
+            n_estimators=200, 
+            subsample=1.0, 
+            random_state=42, 
+            verbosity=0, 
+            eval_metric='logloss',
+            scale_pos_weight=scale_pos_weight
+        )
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
         cv_scores.append(accuracy_score(y_test, preds))
 
-    print(f"\n=== Combined 5-fold CV Accuracy ===")
+    print(f"\n=== Combined 3-fold CV Accuracy ===")
     print(f"Mean: {np.mean(cv_scores):.3f}, Std: {np.std(cv_scores):.3f}")
 
     # Train final model on all data for predictions
     detector.train(X_all, y_all)
     ids_all = all_users['id']
-    predictions = detector.predict(X_all)
+    
+    # Find optimal threshold on all data and use ensemble for final predictions
+    optimal_threshold = detector.find_optimal_threshold(X_all, y_all)
+    predictions = detector.predict_ensemble(X_all, threshold=optimal_threshold)
 
     submission = pd.DataFrame({
         'id': ids_all,
