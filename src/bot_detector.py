@@ -130,7 +130,17 @@ class BotDetector:
             # Add hashtag abuse detection (strong French bot signal)
             post_stats['hashtag_abuse'] = (post_stats['pct_hashtag_posts'] > 0.35).astype(int)
             post_stats['hashtag_url_mismatch'] = ((post_stats['pct_hashtag_posts'] > 0.3) & (post_stats['pct_posts_with_url'] < 0.4)).astype(int)
-
+            # Add TF-IDF text feature aggregation by author (up to 20 sparse textual features)
+            author_text = posts_df.groupby('author_id')['text'].apply(' '.join).reset_index()
+            if len(author_text) > 0:
+                if not self.tfidf_fitted:
+                    self.tfidf.fit(author_text['text'].fillna(''))
+                    self.tfidf_fitted = True
+                tfidf_matrix = self.tfidf.transform(author_text['text'].fillna(''))
+                tfidf_feature_names = [f"tfidf_{i}_{w.replace(' ', '_')}" for i, w in enumerate(self.tfidf.get_feature_names_out())]
+                tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=tfidf_feature_names, index=author_text['author_id'])
+                tfidf_df = tfidf_df.reset_index().rename(columns={'index':'author_id'})
+                post_stats = post_stats.merge(tfidf_df, on='author_id', how='left')
             # Merge with users
             features = features.merge(post_stats, left_on='id', right_on='author_id', how='left')
             features = features.drop('author_id', axis=1)
@@ -398,9 +408,22 @@ if __name__ == "__main__":
     from sklearn.model_selection import StratifiedKFold
 
     detector = BotDetector()
-    data_dir = '../data/'
+
+    # -----------------------------
+    # Dataset folder configuration
+    # -----------------------------
+    # REQUIRED FOR SUBMISSION: ensure dataset files are in this folder
+    # Place your downloaded dataset JSON files here. Example paths:
+    #  - /workspaces/Bot-or-Not-UACS-Competition/data/dataset.posts&users.1.json
+    #  - /workspaces/Bot-or-Not-UACS-Competition/data/dataset.bots.1.txt
+    # Adjust data_dir if your datasets are located elsewhere.
+    data_dir = '../data/'  # first choice, if running from src/
     if not os.path.exists(data_dir):
-        data_dir = 'data/'
+        data_dir = 'data/'   # fallback, if already at repository root
+
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Data directory not found: {data_dir}. place dataset files in data/ or ../data/")
+
     all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.json')]
 
     # Holdout English test: train on 2-6, test on 1
