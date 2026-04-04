@@ -424,7 +424,10 @@ if __name__ == "__main__":
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Data directory not found: {data_dir}. place dataset files in data/ or ../data/")
 
-    all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.json')]
+    # REQUIRED FOR SUBMISSION: set your team name here (will prefix submission files)
+    team_name = "Egyptians"  # Change this to your chosen team name
+
+    all_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.json') and not ('7' in f or '8' in f)]
 
     # Holdout English test: train on 2-6, test on 1
     english_train = [f for f in all_files if '1' not in f]
@@ -505,35 +508,52 @@ if __name__ == "__main__":
     print(f"Predicted {predictions.sum()} bots out of {len(predictions)} users")
 
     # Optional: Predict on separate test datasets (if provided)
-    test_files = []  # Add paths to test JSON files here, e.g. ['data/test1.json', 'data/test2.json']
-    if test_files:
-        print("\n=== Predicting on Test Datasets ===")
+    # REQUIRED FOR SUBMISSION: add paths to final evaluation test JSON files here
+    # Example: test_en_files = ['data/final_test_en.json']
+    # Example: test_fr_files = ['data/final_test_fr.json']
+    test_en_files = ['data/dataset.posts&users.7.json']  # English test datasets
+    test_fr_files = ['data/dataset.posts&users.8.json']  # French test datasets
+
+    if test_en_files:
+        print("\n=== Predicting on English Test Datasets ===")
         test_users, test_posts = [], []
-        for f in test_files:
+        for f in test_en_files:
             users, posts = detector.extract_data(detector.load_data(f))
-            posts['language'] = 'french' if any(x in f for x in ['4', '5', '6']) else 'english'
+            posts['language'] = 'english'
             test_users.append(users)
             test_posts.append(posts)
         test_users = pd.concat(test_users, ignore_index=True)
         test_posts = pd.concat(test_posts, ignore_index=True)
 
         X_test, _, ids_test = detector.prepare_features(test_users, test_posts, target_col=None)
-        test_predictions = detector.predict(X_test)
+        test_predictions = detector.predict_ensemble(X_test, threshold=optimal_threshold)
 
-        test_submission = pd.DataFrame({
-            'id': ids_test,
-            'is_bot': test_predictions
-        })
+        # Save submission file in required format
+        en_output_file = f"{team_name}.detections.en.txt"
+        with open(en_output_file, 'w', encoding='utf-8') as f:
+            for user_id in ids_test[test_predictions == 1]:
+                f.write(f"{user_id}\n")
+        print(f"English detections saved to {en_output_file}")
+        print(f"Predicted {test_predictions.sum()} bots out of {len(test_predictions)} English test users")
 
-        # Save test submission
-        test_submission.to_csv('test_submission.csv', index=False)
-        print("Test submission saved to test_submission.csv")
+    if test_fr_files:
+        print("\n=== Predicting on French Test Datasets ===")
+        test_users, test_posts = [], []
+        for f in test_fr_files:
+            users, posts = detector.extract_data(detector.load_data(f))
+            posts['language'] = 'french'
+            test_users.append(users)
+            test_posts.append(posts)
+        test_users = pd.concat(test_users, ignore_index=True)
+        test_posts = pd.concat(test_posts, ignore_index=True)
 
-        # Save test bot detector output
-        test_bot_ids = ids_test[test_predictions == 1]
-        with open('test_bot_detector_output.txt', 'w', encoding='utf-8') as f:
-            for bot_id in test_bot_ids:
-                f.write(f"{bot_id}\n")
-        print("Test bot detector output saved to test_bot_detector_output.txt")
+        X_test, _, ids_test = detector.prepare_features(test_users, test_posts, target_col=None)
+        test_predictions = detector.predict_ensemble(X_test, threshold=optimal_threshold)
 
-        print(f"Predicted {test_predictions.sum()} bots out of {len(test_predictions)} test users")
+        # Save submission file in required format
+        fr_output_file = f"{team_name}.detections.fr.txt"
+        with open(fr_output_file, 'w', encoding='utf-8') as f:
+            for user_id in ids_test[test_predictions == 1]:
+                f.write(f"{user_id}\n")
+        print(f"French detections saved to {fr_output_file}")
+        print(f"Predicted {test_predictions.sum()} bots out of {len(test_predictions)} French test users")
