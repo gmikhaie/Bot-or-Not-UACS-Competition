@@ -187,7 +187,7 @@ Egyptians Team
 ```
 
 ## Notes
-- The README now explains how the repository works and how the code handles both English and French datasets.
+- The README explains how the repository works and how the code handles both English and French datasets.
 - The final submission files are already generated and present in the repository root.
 
 Overall, I'm proud of what we built. It wasn't perfect, but it was real ML work on a real problem. If you're reading this for a job, hit me up—I'd love to chat about building better systems.
